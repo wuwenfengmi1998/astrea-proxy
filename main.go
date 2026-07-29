@@ -56,6 +56,9 @@ func loadConfig() Config {
 //go:embed polyfill.js
 var polyfillJS []byte
 
+//go:embed session_override.js
+var sessionOverrideJS []byte
+
 func main() {
 	cfg := loadConfig()
 
@@ -83,9 +86,11 @@ func main() {
 		// 1. 去掉废弃的 AppCache manifest
 		html = strings.Replace(html, `manifest="cache.appcache"`, "", 1)
 
-		// 2. 注入 polyfill + 初始化脚本（带版本号防缓存）
+		// 2. 注入 polyfill + session override 脚本（带版本号防缓存）
 		html = strings.Replace(html, "</head>",
-			`<script src="/__polyfill.js?v=4"></script>`+"\n"+`</head>`, 1)
+			`<script src="/__polyfill.js?v=6"></script>`+"\n"+
+			`<script src="/__session_override.js?v=1"></script>`+"\n"+
+			`</head>`, 1)
 
 		r.Body = io.NopCloser(strings.NewReader(html))
 		r.ContentLength = int64(len(html))
@@ -98,6 +103,13 @@ func main() {
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Write(polyfillJS)
+	})
+
+	// 提供 session_override.js
+	http.HandleFunc("/__session_override.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write(sessionOverrideJS)
 	})
 
 	// 拦截 cache.appcache 请求，返回空（避免浏览器报错）

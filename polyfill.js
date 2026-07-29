@@ -1,12 +1,31 @@
 // WebSQL -> IndexedDB shim for Astea Mobile
 // Intercepts window.openDatabase() and translates to IndexedDB
-// v3: Added localStorage cache for synchronous reads, fixed ? param substitution
+// v4: Async-only with localStorage cache for fast reads,
+//     fixed ? params, ORDER BY/LIMIT support, case-insensitive store lookup
 (function() {
     'use strict';
 
     // ── SQL Parser ──────────────────────────────────────────
     function parseSQL(sql) {
         sql = sql.trim();
+
+        // Extract LIMIT from the end (must be done before ORDER BY,
+        // since "ORDER BY Key ASC LIMIT 1" ends with LIMIT, not ASC)
+        let limit = null;
+        let lm = sql.match(/\s+LIMIT\s+(\d+)$/i);
+        if (lm) {
+            limit = parseInt(lm[1]);
+            sql = sql.substring(0, lm.index);
+        }
+
+        // Extract ORDER BY from the end
+        let orderBy = null;
+        let obm = sql.match(/\s+ORDER\s+BY\s+(\w+)\s*(ASC|DESC)?$/i);
+        if (obm) {
+            orderBy = { column: obm[1], dir: (obm[2] || 'ASC').toUpperCase() };
+            sql = sql.substring(0, obm.index);
+        }
+
         const upper = sql.toUpperCase();
 
         let m = upper.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([_a-zA-Z]\w*)/i);
@@ -43,13 +62,13 @@
         }
 
         m = sql.match(/^SELECT\s+(.+?)\s+FROM\s+([_a-zA-Z]\w*)(?:\s+WHERE\s+(.+))?$/i);
-        if (m) return { type: 'SELECT', columns: m[1], table: m[2], where: m[3] || null };
+        if (m) return { type: 'SELECT', columns: m[1], table: m[2],
+            where: m[3] || null, orderBy, limit };
 
         return { type: 'UNKNOWN', sql: sql };
     }
 
     // Parse WHERE clause, substituting ? placeholders with params
-    // paramOffset: index into params where WHERE-clause params start
     function parseWhere(where, params, paramOffset) {
         if (!where) return { conds: null, paramCount: 0 };
         const conds = [];
@@ -68,10 +87,28 @@
         return { conds, paramCount: pIdx - paramOffset };
     }
 
+    // Apply ORDER BY and LIMIT to a rows array
+    function applyOrderByLimit(rows, parsed) {
+        if (parsed.orderBy) {
+            const col = parsed.orderBy.column;
+            const dir = parsed.orderBy.dir;
+            rows = rows.slice().sort((a, b) => {
+                const av = a[col], bv = b[col];
+                if (av == null && bv == null) return 0;
+                if (av == null) return 1;
+                if (bv == null) return -1;
+                if (av < bv) return dir === 'DESC' ? 1 : -1;
+                if (av > bv) return dir === 'DESC' ? -1 : 1;
+                return 0;
+            });
+        }
+        if (parsed.limit != null) {
+            rows = rows.slice(0, parsed.limit);
+        }
+        return rows;
+    }
+
     // ── localStorage Cache ──────────────────────────────────
-    // Pre-loads table data from localStorage so SELECT can be served
-    // synchronously, eliminating the async timing gap that caused
-    // mobileoptions_store to be empty when initSecurity checked it.
     class TableCache {
         constructor(dbName) {
             this.lsPrefix = '__pcf_' + dbName + '_';
@@ -82,7 +119,8 @@
 
         _load() {
             try {
-                const tables = JSON.parse(localStorage.getItem(this.tableListKey) || '[]');
+                const tables = JSON.parse(
+                    localStorage.getItem(this.tableListKey) || '[]');
                 for (const t of tables) {
                     const raw = localStorage.getItem(this.lsPrefix + t);
                     if (raw) this.data[t] = JSON.parse(raw);
@@ -99,28 +137,44 @@
             } catch (e) { /* localStorage might be full */ }
         }
 
-        hasTable(name) { return name in this.data; }
-        getTable(name) { return this.data[name] || []; }
+        // Case-insensitive table lookup
+        _ciKey(name) {
+            if (name in this.data) return name;
+            const lower = name.toLowerCase();
+            for (const key in this.data) {
+                if (key.toLowerCase() === lower) return key;
+            }
+            return null;
+        }
+
+        hasTable(name) { return this._ciKey(name) !== null; }
+        getTable(name) {
+            const k = this._ciKey(name);
+            return k ? this.data[k] : [];
+        }
 
         createTable(name) {
-            if (!(name in this.data)) {
+            if (!this._ciKey(name)) {
                 this.data[name] = [];
                 this._saveTable(name);
             }
         }
 
         insert(table, row) {
-            if (!this.data[table]) this.data[table] = [];
-            const maxId = this.data[table].reduce(
+            const k = this._ciKey(table) || table;
+            if (!this.data[k]) this.data[k] = [];
+            const maxId = this.data[k].reduce(
                 (mx, r) => Math.max(mx, r.id || 0), 0);
             row.id = maxId + 1;
-            this.data[table].push(row);
-            this._saveTable(table);
+            this.data[k].push(row);
+            this._saveTable(k);
             return row.id;
         }
 
         update(table, conds, updates) {
-            const rows = this.data[table] || [];
+            const k = this._ciKey(table);
+            if (!k) return 0;
+            const rows = this.data[k];
             let affected = 0;
             for (const row of rows) {
                 if (conds && !conds.every(c =>
@@ -128,38 +182,42 @@
                 Object.assign(row, updates);
                 affected++;
             }
-            if (affected > 0) this._saveTable(table);
+            if (affected > 0) this._saveTable(k);
             return affected;
         }
 
         deleteRows(table, conds) {
-            if (!this.data[table]) return 0;
+            const k = this._ciKey(table);
+            if (!k) return 0;
             if (!conds) {
-                const count = this.data[table].length;
-                this.data[table] = [];
-                this._saveTable(table);
+                const count = this.data[k].length;
+                this.data[k] = [];
+                this._saveTable(k);
                 return count;
             }
-            const before = this.data[table].length;
-            this.data[table] = this.data[table].filter(row =>
+            const before = this.data[k].length;
+            this.data[k] = this.data[k].filter(row =>
                 !conds.every(c => String(row[c.column]) === String(c.value)));
-            const affected = before - this.data[table].length;
-            if (affected > 0) this._saveTable(table);
+            const affected = before - this.data[k].length;
+            if (affected > 0) this._saveTable(k);
             return affected;
         }
 
         dropTable(table) {
-            delete this.data[table];
-            try {
-                localStorage.removeItem(this.lsPrefix + table);
-                localStorage.setItem(this.tableListKey,
-                    JSON.stringify(Object.keys(this.data)));
-            } catch (e) { /* ignore */ }
+            const k = this._ciKey(table);
+            if (k) {
+                delete this.data[k];
+                try {
+                    localStorage.removeItem(this.lsPrefix + k);
+                    localStorage.setItem(this.tableListKey,
+                        JSON.stringify(Object.keys(this.data)));
+                } catch (e) {}
+            }
         }
 
         selectMaster(name) {
             if (name) {
-                return (name in this.data) ? [{ name }] : [];
+                return this.hasTable(name) ? [{ name }] : [];
             }
             return Object.keys(this.data)
                 .filter(n => n !== '_schema')
@@ -175,8 +233,6 @@
             this.idb = null;
             this._ready = null;
             this._upgrading = false;
-            this._writeQueue = [];
-            this._flushing = false;
         }
 
         ready() {
@@ -201,15 +257,25 @@
             return this._ready;
         }
 
+        // Case-insensitive store name lookup
+        _findStore(name) {
+            if (!this.idb) return null;
+            if (this.idb.objectStoreNames.contains(name)) return name;
+            const lower = name.toLowerCase();
+            for (const sn of this.idb.objectStoreNames) {
+                if (sn.toLowerCase() === lower) return sn;
+            }
+            return null;
+        }
+
         async ensureStore(name) {
             await this.ready();
-            if (this.idb.objectStoreNames.contains(name)) return;
+            if (this._findStore(name)) return;
 
-            // Wait for any in-flight upgrade
             while (this._upgrading) {
                 await new Promise(r => setTimeout(r, 50));
             }
-            if (this.idb.objectStoreNames.contains(name)) return;
+            if (this._findStore(name)) return;
 
             this._upgrading = true;
             const currentVersion = this.idb.version;
@@ -217,9 +283,11 @@
 
             try {
                 await new Promise((resolve, reject) => {
-                    const req = indexedDB.open(this.dbName, currentVersion + 1);
+                    const req = indexedDB.open(
+                        this.dbName, currentVersion + 1);
                     req.onupgradeneeded = () => {
-                        if (!req.result.objectStoreNames.contains(name)) {
+                        if (!this._findStore.call(
+                            { idb: req.result }, name)) {
                             req.result.createObjectStore(name,
                                 { keyPath: 'id', autoIncrement: true });
                         }
@@ -230,7 +298,6 @@
                     };
                     req.onerror = () => reject(req.error);
                     req.onblocked = () => {
-                        // Wait up to 2s for other connections to close
                         setTimeout(() => reject(new Error('Blocked')), 2000);
                     };
                 });
@@ -238,9 +305,8 @@
                 if (e.message === 'Blocked') {
                     await new Promise(r => setTimeout(r, 500));
                     this._upgrading = false;
-                    // Reconnect and retry
                     await this.ready();
-                    if (this.idb.objectStoreNames.contains(name)) return;
+                    if (this._findStore(name)) return;
                     return this.ensureStore(name);
                 }
                 this._upgrading = false;
@@ -249,242 +315,10 @@
             this._upgrading = false;
         }
 
-        // ── Synchronous execution (from cache) ──
-
-        canExecuteSync(parsed) {
-            switch (parsed.type) {
-                case 'CREATE_TABLE':
-                case 'INSERT':
-                case 'INSERT_RAW':
-                case 'UPDATE':
-                case 'DELETE':
-                case 'DROP_TABLE':
-                case 'SELECT_MASTER':
-                    return true;
-                case 'SELECT':
-                    // Only if the table is cached
-                    return this.cache.hasTable(parsed.table);
-                default:
-                    return false;
-            }
-        }
-
-        executeSync(parsed, params) {
-            switch (parsed.type) {
-                case 'CREATE_TABLE':
-                    this.cache.createTable(parsed.table);
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: 0 };
-
-                case 'INSERT': {
-                    const row = {};
-                    for (let i = 0; i < parsed.columns.length; i++) {
-                        row[parsed.columns[i]] = parsed.values[i] === '?'
-                            ? params[i]
-                            : parsed.values[i].replace(/^['"]|['"]$/g, '');
-                    }
-                    const insertId = this.cache.insert(parsed.table, row);
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: 1, insertId };
-                }
-
-                case 'INSERT_RAW': {
-                    const vals = parsed.rawValues.split(',')
-                        .map(v => v.trim().replace(/^['"]|['"]$/g, ''));
-                    this.cache.insert(parsed.table, { _values: vals });
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: 1 };
-                }
-
-                case 'SELECT': {
-                    let rows = this.cache.getTable(parsed.table);
-                    if (parsed.where) {
-                        const { conds } = parseWhere(parsed.where, params, 0);
-                        if (conds) {
-                            rows = rows.filter(row => conds.every(c =>
-                                String(row[c.column]) === String(c.value)));
-                        }
-                    }
-                    // Return shallow copies so callers can't mutate cache
-                    return { rows: rows.map(r => Object.assign({}, r)) };
-                }
-
-                case 'UPDATE': {
-                    // Parse SET clause — track how many params it consumes
-                    const updates = {};
-                    let setParamIdx = 0;
-                    for (const set of parsed.sets) {
-                        if (set.value === '?') {
-                            updates[set.column] = params[setParamIdx++];
-                        } else {
-                            updates[set.column] =
-                                set.value.replace(/^['"]|['"]$/g, '');
-                        }
-                    }
-                    const { conds } = parseWhere(
-                        parsed.where, params, setParamIdx);
-                    const affected = this.cache.update(
-                        parsed.table, conds, updates);
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: affected };
-                }
-
-                case 'DELETE': {
-                    const { conds } = parseWhere(parsed.where, params, 0);
-                    const affected = this.cache.deleteRows(
-                        parsed.table, conds);
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: affected };
-                }
-
-                case 'DROP_TABLE': {
-                    this.cache.dropTable(parsed.table);
-                    this._scheduleAsyncWrite(parsed, params);
-                    return { rowsAffected: 0 };
-                }
-
-                case 'SELECT_MASTER':
-                    return { rows: this.cache.selectMaster(parsed.name) };
-
-                default:
-                    return null;
-            }
-        }
-
-        // ── Async write (flush cache changes to IndexedDB) ──
-
-        _scheduleAsyncWrite(parsed, params) {
-            this._writeQueue.push({ parsed, params });
-            if (!this._flushing) {
-                this._flushing = true;
-                setTimeout(() => this._flushWrites(), 0);
-            }
-        }
-
-        async _flushWrites() {
-            const queue = this._writeQueue;
-            this._writeQueue = [];
-            this._flushing = false;
-            for (const { parsed, params } of queue) {
-                try {
-                    await this._writeToIDB(parsed, params);
-                } catch (e) {
-                    console.error('[polyfill] async write failed:', e);
-                }
-            }
-        }
-
-        async _writeToIDB(parsed, params) {
-            await this.ready();
-            switch (parsed.type) {
-                case 'CREATE_TABLE': {
-                    await this.ensureStore(parsed.table);
-                    const tx = this.idb.transaction('_schema', 'readwrite');
-                    tx.objectStore('_schema')
-                        .put({ name: parsed.table, type: 'table' });
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    break;
-                }
-                case 'INSERT': {
-                    await this.ensureStore(parsed.table);
-                    const row = {};
-                    for (let i = 0; i < parsed.columns.length; i++) {
-                        row[parsed.columns[i]] = parsed.values[i] === '?'
-                            ? params[i]
-                            : parsed.values[i].replace(/^['"]|['"]$/g, '');
-                    }
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    tx.objectStore(parsed.table).add(row);
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    break;
-                }
-                case 'INSERT_RAW': {
-                    await this.ensureStore(parsed.table);
-                    const vals = parsed.rawValues.split(',')
-                        .map(v => v.trim().replace(/^['"]|['"]$/g, ''));
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    tx.objectStore(parsed.table).add({ _values: vals });
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    break;
-                }
-                case 'UPDATE': {
-                    if (!this.idb.objectStoreNames.contains(parsed.table))
-                        break;
-                    const updates = {};
-                    let setParamIdx = 0;
-                    for (const set of parsed.sets) {
-                        if (set.value === '?') {
-                            updates[set.column] = params[setParamIdx++];
-                        } else {
-                            updates[set.column] =
-                                set.value.replace(/^['"]|['"]$/g, '');
-                        }
-                    }
-                    const { conds } = parseWhere(
-                        parsed.where, params, setParamIdx);
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    const store = tx.objectStore(parsed.table);
-                    const all = await new Promise(resolve => {
-                        const req = store.getAll();
-                        req.onsuccess = () => resolve(req.result);
-                        req.onerror = () => resolve([]);
-                    });
-                    for (const row of all) {
-                        if (conds && !conds.every(c =>
-                            String(row[c.column]) === String(c.value)))
-                            continue;
-                        Object.assign(row, updates);
-                        store.put(row);
-                    }
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    break;
-                }
-                case 'DELETE': {
-                    if (!this.idb.objectStoreNames.contains(parsed.table))
-                        break;
-                    const { conds } = parseWhere(parsed.where, params, 0);
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    const store = tx.objectStore(parsed.table);
-                    const all = await new Promise(resolve => {
-                        const req = store.getAll();
-                        req.onsuccess = () => resolve(req.result);
-                        req.onerror = () => resolve([]);
-                    });
-                    if (!conds) {
-                        for (const row of all) store.delete(row.id);
-                    } else {
-                        for (const row of all) {
-                            if (conds.every(c =>
-                                String(row[c.column]) === String(c.value)))
-                                store.delete(row.id);
-                        }
-                    }
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    break;
-                }
-                case 'DROP_TABLE': {
-                    await this.deleteStore(parsed.table);
-                    await this.ready();
-                    const tx = this.idb.transaction('_schema', 'readwrite');
-                    tx.objectStore('_schema').delete(parsed.table);
-                    await new Promise(r => { tx.oncomplete = r; });
-                    break;
-                }
-            }
-        }
-
         async deleteStore(name) {
             await this.ready();
-            if (!this.idb.objectStoreNames.contains(name)) return;
+            const actual = this._findStore(name);
+            if (!actual) return;
             while (this._upgrading) {
                 await new Promise(r => setTimeout(r, 50));
             }
@@ -496,7 +330,9 @@
                     const req = indexedDB.open(
                         this.dbName, currentVersion + 1);
                     req.onupgradeneeded = () => {
-                        req.result.deleteObjectStore(name);
+                        const a = this._findStore.call(
+                            { idb: req.result }, name);
+                        if (a) req.result.deleteObjectStore(a);
                     };
                     req.onsuccess = () => {
                         this.idb = req.result;
@@ -519,72 +355,75 @@
             this._upgrading = false;
         }
 
-        // ── Async execution (cache miss fallback) ──
-        // Used when the table is not in the cache (first load).
-        // Reads from IndexedDB and populates the cache.
-
         async execute(parsed, params) {
-            await this.ready();
-
             switch (parsed.type) {
                 case 'CREATE_TABLE': {
-                    await this.ensureStore(parsed.table);
-                    const tx = this.idb.transaction('_schema', 'readwrite');
-                    tx.objectStore('_schema')
-                        .put({ name: parsed.table, type: 'table' });
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
                     this.cache.createTable(parsed.table);
+                    await this.ready();
+                    await this.ensureStore(parsed.table);
+                    try {
+                        const tx = this.idb.transaction('_schema', 'readwrite');
+                        tx.objectStore('_schema')
+                            .put({ name: parsed.table, type: 'table' });
+                        await new Promise(r =>
+                            { tx.oncomplete = r; tx.onerror = r; });
+                    } catch (e) { /* non-critical */ }
                     return { rowsAffected: 0 };
                 }
 
                 case 'INSERT': {
-                    await this.ensureStore(parsed.table);
                     const row = {};
                     for (let i = 0; i < parsed.columns.length; i++) {
                         row[parsed.columns[i]] = parsed.values[i] === '?'
                             ? params[i]
                             : parsed.values[i].replace(/^['"]|['"]$/g, '');
                     }
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    const store = tx.objectStore(parsed.table);
-                    let insertId = 0;
-                    store.add(row).onsuccess = (e) => {
-                        insertId = e.target.result;
-                    };
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    this.cache.insert(parsed.table, row);
+                    const insertId = this.cache.insert(parsed.table, row);
+                    await this.ready();
+                    await this.ensureStore(parsed.table);
+                    const sn1 = this._findStore(parsed.table);
+                    if (sn1) {
+                        const tx = this.idb.transaction(sn1, 'readwrite');
+                        tx.objectStore(sn1).add(row);
+                        await new Promise(r =>
+                            { tx.oncomplete = r; tx.onerror = r; });
+                    }
                     return { rowsAffected: 1, insertId };
                 }
 
                 case 'INSERT_RAW': {
-                    await this.ensureStore(parsed.table);
                     const vals = parsed.rawValues.split(',')
                         .map(v => v.trim().replace(/^['"]|['"]$/g, ''));
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    tx.objectStore(parsed.table).add({ _values: vals });
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
+                    this.cache.insert(parsed.table, { _values: vals });
+                    await this.ready();
+                    await this.ensureStore(parsed.table);
+                    const sn2 = this._findStore(parsed.table);
+                    if (sn2) {
+                        const tx = this.idb.transaction(sn2, 'readwrite');
+                        tx.objectStore(sn2).add({ _values: vals });
+                        await new Promise(r =>
+                            { tx.oncomplete = r; tx.onerror = r; });
+                    }
                     return { rowsAffected: 1 };
                 }
 
                 case 'SELECT': {
-                    if (!this.idb.objectStoreNames.contains(parsed.table)) {
+                    // Always read from IndexedDB (truly async) to avoid
+                    // microtask chains that freeze the page
+                    await this.ready();
+                    const storeName = this._findStore(parsed.table);
+                    if (!storeName) {
                         this.cache.createTable(parsed.table);
                         return { rows: [] };
                     }
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readonly');
-                    const store = tx.objectStore(parsed.table);
+                    const tx = this.idb.transaction(storeName, 'readonly');
+                    const store = tx.objectStore(storeName);
                     const all = await new Promise(resolve => {
                         const req = store.getAll();
                         req.onsuccess = () => resolve(req.result);
                         req.onerror = () => resolve([]);
                     });
-                    // Populate cache for future synchronous reads
+                    // Populate cache for Session.getMobileOption override
                     this.cache.data[parsed.table] = all;
                     this.cache._saveTable(parsed.table);
 
@@ -597,13 +436,11 @@
                                 String(row[c.column]) === String(c.value)));
                         }
                     }
+                    rows = applyOrderByLimit(rows, parsed);
                     return { rows: rows.map(r => Object.assign({}, r)) };
                 }
 
                 case 'UPDATE': {
-                    if (!this.idb.objectStoreNames.contains(parsed.table)) {
-                        return { rowsAffected: 0 };
-                    }
                     const updates = {};
                     let setParamIdx = 0;
                     for (const set of parsed.sets) {
@@ -616,73 +453,83 @@
                     }
                     const { conds } = parseWhere(
                         parsed.where, params, setParamIdx);
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    const store = tx.objectStore(parsed.table);
-                    const all = await new Promise(resolve => {
-                        store.getAll().onsuccess = (e) =>
-                            resolve(e.target.result);
-                    });
-                    let affected = 0;
-                    for (const row of all) {
-                        if (conds && !conds.every(c =>
-                            String(row[c.column]) === String(c.value)))
-                            continue;
-                        Object.assign(row, updates);
-                        store.put(row);
-                        affected++;
+                    const affected = this.cache.update(
+                        parsed.table, conds, updates);
+                    // Write to IndexedDB
+                    await this.ready();
+                    const sn3 = this._findStore(parsed.table);
+                    if (sn3) {
+                        const tx = this.idb.transaction(sn3, 'readwrite');
+                        const store = tx.objectStore(sn3);
+                        const all = await new Promise(resolve => {
+                            const req = store.getAll();
+                            req.onsuccess = () => resolve(req.result);
+                            req.onerror = () => resolve([]);
+                        });
+                        for (const row of all) {
+                            if (conds && !conds.every(c =>
+                                String(row[c.column]) === String(c.value)))
+                                continue;
+                            Object.assign(row, updates);
+                            store.put(row);
+                        }
+                        await new Promise(r =>
+                            { tx.oncomplete = r; tx.onerror = r; });
                     }
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    this.cache.update(parsed.table, conds, updates);
                     return { rowsAffected: affected };
                 }
 
                 case 'DELETE': {
-                    if (!this.idb.objectStoreNames.contains(parsed.table))
-                        return { rowsAffected: 0 };
                     const { conds } = parseWhere(parsed.where, params, 0);
-                    const tx = this.idb.transaction(
-                        parsed.table, 'readwrite');
-                    const store = tx.objectStore(parsed.table);
-                    const all = await new Promise(resolve => {
-                        store.getAll().onsuccess = (e) =>
-                            resolve(e.target.result);
-                    });
-                    let affected = 0;
-                    if (!conds) {
-                        for (const row of all) store.delete(row.id);
-                        affected = all.length;
-                    } else {
-                        for (const row of all) {
-                            if (conds.every(c =>
-                                String(row[c.column]) === String(c.value))) {
-                                store.delete(row.id);
-                                affected++;
+                    const affected = this.cache.deleteRows(
+                        parsed.table, conds);
+                    await this.ready();
+                    const sn4 = this._findStore(parsed.table);
+                    if (sn4) {
+                        const tx = this.idb.transaction(sn4, 'readwrite');
+                        const store = tx.objectStore(sn4);
+                        const all = await new Promise(resolve => {
+                            const req = store.getAll();
+                            req.onsuccess = () => resolve(req.result);
+                            req.onerror = () => resolve([]);
+                        });
+                        if (!conds) {
+                            for (const row of all) store.delete(row.id);
+                        } else {
+                            for (const row of all) {
+                                if (conds.every(c =>
+                                    String(row[c.column]) === String(c.value)))
+                                    store.delete(row.id);
                             }
                         }
+                        await new Promise(r =>
+                            { tx.oncomplete = r; tx.onerror = r; });
                     }
-                    await new Promise(r =>
-                        { tx.oncomplete = r; tx.onerror = r; });
-                    this.cache.deleteRows(parsed.table, conds);
                     return { rowsAffected: affected };
                 }
 
                 case 'DROP_TABLE': {
+                    this.cache.dropTable(parsed.table);
                     await this.deleteStore(parsed.table);
                     await this.ready();
-                    const tx = this.idb.transaction('_schema', 'readwrite');
-                    tx.objectStore('_schema').delete(parsed.table);
-                    await new Promise(r => { tx.oncomplete = r; });
-                    this.cache.dropTable(parsed.table);
+                    try {
+                        const tx = this.idb.transaction('_schema', 'readwrite');
+                        tx.objectStore('_schema').delete(parsed.table);
+                        await new Promise(r => { tx.oncomplete = r; });
+                    } catch (e) { /* non-critical */ }
                     return { rowsAffected: 0 };
                 }
 
                 case 'SELECT_MASTER': {
+                    // Check cache first (just for table existence)
+                    if (this.cache.data &&
+                        Object.keys(this.cache.data).length > 0) {
+                        return { rows: this.cache.selectMaster(parsed.name) };
+                    }
+                    await this.ready();
                     if (parsed.name) {
-                        return { rows: this.idb.objectStoreNames
-                            .contains(parsed.name)
-                                ? [{ name: parsed.name }] : [] };
+                        return { rows: this._findStore(parsed.name)
+                            ? [{ name: parsed.name }] : [] };
                     }
                     return { rows: Array.from(this.idb.objectStoreNames)
                         .filter(n => n !== '_schema')
@@ -706,16 +553,6 @@
         transaction(fn, errorFn, successFn) {
             const tx = new WebSQLTransaction(this);
             fn(tx);
-
-            // Try synchronous execution from cache first.
-            // This eliminates the async timing gap that caused
-            // mobileoptions_store to be empty when checked.
-            if (tx._trySync()) {
-                if (typeof successFn === 'function') successFn();
-                return;
-            }
-
-            // Fall back to async IndexedDB execution
             tx._exec().then(() => {
                 if (typeof successFn === 'function') successFn();
             }).catch(err => {
@@ -737,44 +574,6 @@
 
         executeSql(sql, params, successFn, errorFn) {
             this.queue.push({ sql, params: params || [], successFn, errorFn });
-        }
-
-        // Attempt to execute all queued statements synchronously
-        // from the in-memory cache. Returns true if successful,
-        // false if async execution is needed.
-        _trySync() {
-            // First pass: verify all statements can be served from cache
-            const parsed = [];
-            for (const item of this.queue) {
-                const p = parseSQL(item.sql);
-                if (!this.db.idb.canExecuteSync(p)) return false;
-                parsed.push({ item, p });
-            }
-
-            // Second pass: execute all synchronously
-            for (const { item, p } of parsed) {
-                try {
-                    const result = this.db.idb.executeSync(p, item.params);
-                    if (result === null) return false;
-                    const wrapped = {
-                        insertId: result.insertId || 0,
-                        rowsAffected: result.rowsAffected || 0,
-                        rows: {
-                            _data: result.rows || [],
-                            get length() { return this._data.length; },
-                            item: function(i) { return this._data[i]; }
-                        }
-                    };
-                    if (typeof item.successFn === 'function')
-                        item.successFn(this, wrapped);
-                } catch (err) {
-                    console.error('[polyfill] sync error:', item.sql, err);
-                    if (typeof item.errorFn === 'function')
-                        item.errorFn(this, err);
-                    return true; // Handled (with error)
-                }
-            }
-            return true;
         }
 
         async _exec() {
@@ -809,5 +608,5 @@
         return new WebSQLDatabase(name);
     };
 
-    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v3)');
+    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v5)');
 })();
