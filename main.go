@@ -85,7 +85,7 @@ func main() {
 
 		// 2. 注入 polyfill + 初始化脚本（带版本号防缓存）
 		html = strings.Replace(html, "</head>",
-			`<script src="/__polyfill.js?v=3"></script>`+"\n"+`</head>`, 1)
+			`<script src="/__polyfill.js?v=4"></script>`+"\n"+`</head>`, 1)
 
 		r.Body = io.NopCloser(strings.NewReader(html))
 		r.ContentLength = int64(len(html))
