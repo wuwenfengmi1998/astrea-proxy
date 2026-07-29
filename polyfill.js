@@ -260,9 +260,11 @@
         // Case-insensitive store name lookup
         _findStore(name) {
             if (!this.idb) return null;
-            if (this.idb.objectStoreNames.contains(name)) return name;
+            const names = this.idb.objectStoreNames;
+            if (names.contains(name)) return name;
             const lower = name.toLowerCase();
-            for (const sn of this.idb.objectStoreNames) {
+            for (let i = 0; i < names.length; i++) {
+                const sn = names.item(i);
                 if (sn.toLowerCase() === lower) return sn;
             }
             return null;
@@ -286,9 +288,9 @@
                     const req = indexedDB.open(
                         this.dbName, currentVersion + 1);
                     req.onupgradeneeded = () => {
-                        if (!this._findStore.call(
-                            { idb: req.result }, name)) {
-                            req.result.createObjectStore(name,
+                        const db = req.result;
+                        if (!db.objectStoreNames.contains(name)) {
+                            db.createObjectStore(name,
                                 { keyPath: 'id', autoIncrement: true });
                         }
                     };
@@ -330,9 +332,10 @@
                     const req = indexedDB.open(
                         this.dbName, currentVersion + 1);
                     req.onupgradeneeded = () => {
-                        const a = this._findStore.call(
-                            { idb: req.result }, name);
-                        if (a) req.result.deleteObjectStore(a);
+                        const db = req.result;
+                        if (db.objectStoreNames.contains(name)) {
+                            db.deleteObjectStore(name);
+                        }
                     };
                     req.onsuccess = () => {
                         this.idb = req.result;
@@ -366,7 +369,7 @@
                         tx.objectStore('_schema')
                             .put({ name: parsed.table, type: 'table' });
                         await new Promise(r =>
-                            { tx.oncomplete = r; tx.onerror = r; });
+                            { tx.oncomplete = r; tx.onerror = r; tx.onabort = r; });
                     } catch (e) { /* non-critical */ }
                     return { rowsAffected: 0 };
                 }
@@ -386,7 +389,7 @@
                         const tx = this.idb.transaction(sn1, 'readwrite');
                         tx.objectStore(sn1).add(row);
                         await new Promise(r =>
-                            { tx.oncomplete = r; tx.onerror = r; });
+                            { tx.oncomplete = r; tx.onerror = r; tx.onabort = r; });
                     }
                     return { rowsAffected: 1, insertId };
                 }
@@ -402,7 +405,7 @@
                         const tx = this.idb.transaction(sn2, 'readwrite');
                         tx.objectStore(sn2).add({ _values: vals });
                         await new Promise(r =>
-                            { tx.oncomplete = r; tx.onerror = r; });
+                            { tx.oncomplete = r; tx.onerror = r; tx.onabort = r; });
                     }
                     return { rowsAffected: 1 };
                 }
@@ -474,7 +477,7 @@
                             store.put(row);
                         }
                         await new Promise(r =>
-                            { tx.oncomplete = r; tx.onerror = r; });
+                            { tx.oncomplete = r; tx.onerror = r; tx.onabort = r; });
                     }
                     return { rowsAffected: affected };
                 }
@@ -503,7 +506,7 @@
                             }
                         }
                         await new Promise(r =>
-                            { tx.oncomplete = r; tx.onerror = r; });
+                            { tx.oncomplete = r; tx.onerror = r; tx.onabort = r; });
                     }
                     return { rowsAffected: affected };
                 }
@@ -515,7 +518,7 @@
                     try {
                         const tx = this.idb.transaction('_schema', 'readwrite');
                         tx.objectStore('_schema').delete(parsed.table);
-                        await new Promise(r => { tx.oncomplete = r; });
+                        await new Promise(r => { tx.oncomplete = r; tx.onabort = r; });
                     } catch (e) { /* non-critical */ }
                     return { rowsAffected: 0 };
                 }
@@ -531,9 +534,13 @@
                         return { rows: this._findStore(parsed.name)
                             ? [{ name: parsed.name }] : [] };
                     }
-                    return { rows: Array.from(this.idb.objectStoreNames)
-                        .filter(n => n !== '_schema')
-                        .map(n => ({ name: n })) };
+                    const names = this.idb.objectStoreNames;
+                    const result = [];
+                    for (let i = 0; i < names.length; i++) {
+                        const n = names.item(i);
+                        if (n !== '_schema') result.push({ name: n });
+                    }
+                    return { rows: result };
                 }
 
                 default:
@@ -608,5 +615,5 @@
         return new WebSQLDatabase(name);
     };
 
-    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v5)');
+    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v6)');
 })();
