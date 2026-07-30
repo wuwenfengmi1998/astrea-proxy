@@ -114,6 +114,7 @@
             this.lsPrefix = '__pcf_' + dbName + '_';
             this.tableListKey = '__pcf_' + dbName + '_tables';
             this.data = {};
+            this._dirty = new Set();
             this._load();
         }
 
@@ -128,13 +129,22 @@
             } catch (e) { /* ignore */ }
         }
 
-        _saveTable(name) {
+        _markDirty(name) {
+            this._dirty.add(this._ciKey(name) || name);
+        }
+
+        flushDirty() {
+            for (const name of this._dirty) {
+                try {
+                    localStorage.setItem(this.lsPrefix + name,
+                        JSON.stringify(this.data[name] || []));
+                } catch (e) { /* localStorage might be full */ }
+            }
             try {
-                localStorage.setItem(this.lsPrefix + name,
-                    JSON.stringify(this.data[name] || []));
                 localStorage.setItem(this.tableListKey,
                     JSON.stringify(Object.keys(this.data)));
             } catch (e) { /* localStorage might be full */ }
+            this._dirty.clear();
         }
 
         // Case-insensitive table lookup
@@ -156,7 +166,7 @@
         createTable(name) {
             if (!this._ciKey(name)) {
                 this.data[name] = [];
-                this._saveTable(name);
+                this._markDirty(name);
             }
         }
 
@@ -167,7 +177,7 @@
                 (mx, r) => Math.max(mx, r.id || 0), 0);
             row.id = maxId + 1;
             this.data[k].push(row);
-            this._saveTable(k);
+            this._markDirty(k);
             return row.id;
         }
 
@@ -182,7 +192,7 @@
                 Object.assign(row, updates);
                 affected++;
             }
-            if (affected > 0) this._saveTable(k);
+            if (affected > 0) this._markDirty(k);
             return affected;
         }
 
@@ -192,14 +202,14 @@
             if (!conds) {
                 const count = this.data[k].length;
                 this.data[k] = [];
-                this._saveTable(k);
+                this._markDirty(k);
                 return count;
             }
             const before = this.data[k].length;
             this.data[k] = this.data[k].filter(row =>
                 !conds.every(c => String(row[c.column]) === String(c.value)));
             const affected = before - this.data[k].length;
-            if (affected > 0) this._saveTable(k);
+            if (affected > 0) this._markDirty(k);
             return affected;
         }
 
@@ -268,6 +278,61 @@
                 if (sn.toLowerCase() === lower) return sn;
             }
             return null;
+        }
+
+        async ensureStores(names) {
+            await this.ready();
+            const needCreate = names.filter(n => !this._findStore(n));
+            if (needCreate.length === 0) return;
+
+            while (this._upgrading) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+            const stillNeed = needCreate.filter(n => !this._findStore(n));
+            if (stillNeed.length === 0) return;
+
+            this._upgrading = true;
+            const currentVersion = this.idb.version;
+            this.idb.close();
+
+            try {
+                await new Promise((resolve, reject) => {
+                    const req = indexedDB.open(
+                        this.dbName, currentVersion + 1);
+                    req.onupgradeneeded = () => {
+                        const db = req.result;
+                        for (const name of stillNeed) {
+                            if (!db.objectStoreNames.contains(name)) {
+                                db.createObjectStore(name,
+                                    { keyPath: 'id', autoIncrement: true });
+                            }
+                        }
+                    };
+                    req.onsuccess = () => {
+                        this.idb = req.result;
+                        resolve();
+                    };
+                    req.onerror = () => reject(req.error);
+                    req.onblocked = () => {
+                        setTimeout(() => reject(new Error('Blocked')), 2000);
+                    };
+                });
+            } catch (e) {
+                if (e.message === 'Blocked') {
+                    await new Promise(r => setTimeout(r, 500));
+                    this._upgrading = false;
+                    await this.ready();
+                    const remaining = stillNeed.filter(
+                        n => !this._findStore(n));
+                    if (remaining.length > 0) {
+                        return this.ensureStores(remaining);
+                    }
+                    return;
+                }
+                this._upgrading = false;
+                throw e;
+            }
+            this._upgrading = false;
         }
 
         async ensureStore(name) {
@@ -411,8 +476,20 @@
                 }
 
                 case 'SELECT': {
-                    // Always read from IndexedDB (truly async) to avoid
-                    // microtask chains that freeze the page
+                    if (this.cache.hasTable(parsed.table)) {
+                        let rows = this.cache.getTable(parsed.table);
+                        if (parsed.where) {
+                            const { conds } = parseWhere(
+                                parsed.where, params, 0);
+                            if (conds) {
+                                rows = rows.filter(row => conds.every(c =>
+                                    String(row[c.column]) === String(c.value)));
+                            }
+                        }
+                        rows = applyOrderByLimit(rows, parsed);
+                        return { rows: rows.map(r => Object.assign({}, r)) };
+                    }
+
                     await this.ready();
                     const storeName = this._findStore(parsed.table);
                     if (!storeName) {
@@ -426,9 +503,8 @@
                         req.onsuccess = () => resolve(req.result);
                         req.onerror = () => resolve([]);
                     });
-                    // Populate cache for Session.getMobileOption override
                     this.cache.data[parsed.table] = all;
-                    this.cache._saveTable(parsed.table);
+                    this.cache._markDirty(parsed.table);
 
                     let rows = all;
                     if (parsed.where) {
@@ -584,6 +660,23 @@
         }
 
         async _exec() {
+            const tablesToCreate = new Set();
+            for (const item of this.queue) {
+                const parsed = parseSQL(item.sql);
+                if (parsed.type === 'CREATE_TABLE' ||
+                    parsed.type === 'INSERT' ||
+                    parsed.type === 'INSERT_RAW') {
+                    tablesToCreate.add(parsed.table);
+                }
+            }
+            if (tablesToCreate.size > 0) {
+                try {
+                    await this.db.idb.ensureStores([...tablesToCreate]);
+                } catch (e) {
+                    console.error('[polyfill] batch ensureStores error:', e);
+                }
+            }
+
             for (const item of this.queue) {
                 try {
                     const parsed = parseSQL(item.sql);
@@ -607,6 +700,8 @@
                         item.errorFn(this, err);
                 }
             }
+
+            this.db.cache.flushDirty();
         }
     }
 
@@ -615,5 +710,5 @@
         return new WebSQLDatabase(name);
     };
 
-    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v6)');
+    console.log('[polyfill] WebSQL -> IndexedDB shim loaded (v7)');
 })();

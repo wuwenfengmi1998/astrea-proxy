@@ -88,7 +88,7 @@ func main() {
 
 		// 2. 注入 polyfill + session override 脚本（带版本号防缓存）
 		html = strings.Replace(html, "</head>",
-			`<script src="/__polyfill.js?v=7"></script>`+"\n"+
+			`<script src="/__polyfill.js?v=8"></script>`+"\n"+
 			`<script src="/__session_override.js?v=1"></script>`+"\n"+
 			`</head>`, 1)
 
